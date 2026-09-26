@@ -298,7 +298,10 @@ public func gatedDeltaUpdate(
         state = state.asType(.float32)
     }
 
-    if GatedDeltaKernelManager.shared.kernel != nil {
+    // Custom Metal kernels only run on the GPU stream. On machines where the
+    // default device is the CPU (e.g. the Intel/AMD port), fall back to the ops
+    // implementation instead of crashing in mlx-c.
+    if Device.defaultDevice().deviceType == .gpu, GatedDeltaKernelManager.shared.kernel != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
     }
 
