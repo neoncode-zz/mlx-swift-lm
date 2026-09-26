@@ -270,6 +270,93 @@ func gatedDeltaOps(
     return (y, state)
 }
 
+// MARK: - Chunked (WY) Prefill
+
+/// Sequence length from which the chunked form beats the per-token loop on the
+/// CPU backend. Measured on an Intel i7-10700K (H=16, D=128): T=16 is 2.4x,
+/// T=32 4x, T>=64 6-7x faster; below 16 the fixed per-chunk cost dominates.
+let gatedDeltaChunkedMinLength = 16
+
+/// Chunk length of the WY decomposition (matmul size inside a chunk).
+let gatedDeltaChunkSize = 64
+
+/// Chunked (WY / UT-transform) evaluation of the gated delta rule. Mathematically
+/// identical to `gatedDeltaOps` (relative error ~1e-7 in fp32), but replaces the
+/// T sequential rank-1 state updates with ceil(T/C) chunk steps built from
+/// matmuls, which is what makes prefill fast on the CPU backend.
+///
+/// Shapes: q, k `[B, T, H, Dk]` (already repeated to Hv heads), v `[B, T, H, Dv]`,
+/// logG and beta `[B, T, H]`, state `[B, H, Dv, Dk]`.
+private func gatedDeltaChunked(
+    q: MLXArray,
+    k: MLXArray,
+    v: MLXArray,
+    logG: MLXArray,
+    beta: MLXArray,
+    state: MLXArray,
+    chunkSize C: Int
+) -> (MLXArray, MLXArray) {
+    let B = q.dim(0)
+    let T = q.dim(1)
+    let H = q.dim(2)
+    let N = (T + C - 1) / C
+    let pad = N * C - T
+
+    // [B, T, H, ...] -> [B, H, N, C, ...] in fp32. Padded steps carry k = v = beta = 0
+    // and logG = 0, so they neither decay nor write the state.
+    func toChunks(_ x: MLXArray) -> MLXArray {
+        var x = x.asType(.float32)
+        x = x.ndim == 4 ? x.transposed(0, 2, 1, 3) : x.transposed(0, 2, 1)
+        if pad > 0 {
+            var widths = Array(repeating: IntOrPair(0), count: x.ndim)
+            widths[2] = IntOrPair((0, pad))
+            x = padded(x, widths: widths)
+        }
+        return x.ndim == 4 ? x.reshaped(B, H, N, C, x.dim(3)) : x.reshaped(B, H, N, C)
+    }
+
+    let qc = toChunks(q)
+    let kc = toChunks(k)
+    let vc = toChunks(v)
+    let bc = toChunks(beta)
+    let lg = cumsum(toChunks(logG), axis: -1)  // [B, H, N, C] cumulative log-decay
+
+    let lower = tril(MLXArray.ones([C, C], dtype: .bool))
+    let strictLower = tril(MLXArray.ones([C, C], dtype: .bool), k: -1)
+    let lgDiff = expandedDimensions(lg, axis: -1) - expandedDimensions(lg, axis: -2)
+    let decay = exp(MLX.where(lower, lgDiff, MLXArray(-Float.infinity)))  // [B, H, N, C, C]
+
+    let kBeta = kc * expandedDimensions(bc, axis: -1)
+    let vBeta = vc * expandedDimensions(bc, axis: -1)
+    let a = MLX.where(
+        strictLower, matmul(kBeta, kc.swappedAxes(-1, -2)) * decay, MLXArray(Float(0)))
+    let tInv = MLXLinalg.triInv(a + MLXArray.eye(C), upper: false, stream: .cpu)
+    let u = matmul(tInv, vBeta)  // [B, H, N, C, Dv]
+    let w = matmul(tInv, kBeta * expandedDimensions(exp(lg), axis: -1))  // [B, H, N, C, Dk]
+    let qk = MLX.where(
+        lower, matmul(qc, kc.swappedAxes(-1, -2)) * decay, MLXArray(Float(0)))
+
+    var s = state.asType(.float32).swappedAxes(-1, -2)  // [B, H, Dk, Dv]
+    var outputs = [MLXArray]()
+    outputs.reserveCapacity(N)
+    for n in 0 ..< N {
+        let lgN = lg[0..., 0..., n]  // [B, H, C]
+        let lgLast = lgN[0..., 0..., (C - 1) ..< C]  // [B, H, 1]
+        let vNew = u[0..., 0..., n] - matmul(w[0..., 0..., n], s)
+        let inter = matmul(qc[0..., 0..., n] * expandedDimensions(exp(lgN), axis: -1), s)
+        outputs.append(inter + matmul(qk[0..., 0..., n], vNew))
+        let kDecayed = kc[0..., 0..., n] * expandedDimensions(exp(lgLast - lgN), axis: -1)
+        s = s * expandedDimensions(exp(lgLast), axis: -1)
+            + matmul(kDecayed.swappedAxes(-1, -2), vNew)
+    }
+
+    var y = concatenated(outputs, axis: 2)  // [B, H, N*C, Dv]
+    if pad > 0 {
+        y = y[0..., 0..., 0 ..< T]
+    }
+    return (y.transposed(0, 2, 1, 3).asType(q.dtype), s.swappedAxes(-1, -2))
+}
+
 // MARK: - Public API
 
 public func gatedDeltaUpdate(
@@ -303,6 +390,24 @@ public func gatedDeltaUpdate(
     // implementation instead of crashing in mlx-c.
     if Device.defaultDevice().deviceType == .gpu, GatedDeltaKernelManager.shared.kernel != nil {
         return gatedDeltaKernel(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
+    }
+
+    // Prefill on the CPU backend: the chunked form turns T sequential state
+    // updates into matmuls. Decode (T = 1) and masked batches keep the loop.
+    let T = q.dim(1)
+    if T >= gatedDeltaChunkedMinLength, mask == nil, a.ndim == 3 {
+        var qh = q
+        var kh = k
+        let repeatFactor = Hv / q.dim(2)
+        if repeatFactor > 1 {
+            qh = repeated(qh, count: repeatFactor, axis: -2)
+            kh = repeated(kh, count: repeatFactor, axis: -2)
+        }
+        // log of computeGatedDeltaG, computed directly to avoid log(exp(x)) rounding.
+        let logG = -exp(aLog.asType(.float32)) * softplus(a + dtBias)
+        return gatedDeltaChunked(
+            q: qh, k: kh, v: v, logG: logG, beta: beta, state: state,
+            chunkSize: gatedDeltaChunkSize)
     }
 
     return gatedDeltaOps(q: q, k: k, v: v, g: g, beta: beta, state: state, mask: mask)
